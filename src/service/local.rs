@@ -1,11 +1,22 @@
 //! Local server launchers
 
-use std::{net::IpAddr, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    fmt::{self, Display},
+    future::Future,
+    net::IpAddr,
+    path::PathBuf,
+    process::ExitCode,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use clap::{builder::PossibleValuesParser, Arg, ArgAction, ArgGroup, ArgMatches, Command, ValueHint};
-use futures::future::{self, Either};
-use log::{info, trace};
-use tokio::{self, runtime::Builder};
+use futures::future::{self, BoxFuture, FutureExt};
+use log::{error, info, trace};
+use tokio::{
+    self,
+    runtime::{Builder, Runtime},
+};
 
 #[cfg(feature = "local-redir")]
 use shadowsocks_service::config::RedirType;
@@ -22,10 +33,9 @@ use shadowsocks_service::{
         ProtocolType,
         ServerInstanceConfig,
     },
-    create_local,
-    local::loadbalancing::PingBalancer,
+    local::{loadbalancing::PingBalancer, Server},
     shadowsocks::{
-        config::{Mode, ServerAddr, ServerConfig},
+        config::{Mode, ServerAddr, ServerConfig, ServerSource},
         crypto::{available_ciphers, CipherKind},
         plugin::PluginConfig,
     },
@@ -87,7 +97,7 @@ pub fn define_command_line_options(mut app: Command) -> Command {
             .action(ArgAction::Set)
             .value_parser(clap::value_parser!(PathBuf))
             .value_hint(ValueHint::FilePath)
-            .help("Shadowsocks configuration file (https://shadowsocks.org/guide/configs.html)"),
+            .help("Shadowsocks configuration file (https://shadowsocks.org/doc/configs.html)"),
     )
     .arg(
         Arg::new("LOCAL_ADDR")
@@ -175,6 +185,14 @@ pub fn define_command_line_options(mut app: Command) -> Command {
             .help("SIP003 (https://shadowsocks.org/guide/sip003.html) plugin"),
     )
     .arg(
+        Arg::new("PLUGIN_MODE")
+            .long("plugin-mode")
+            .num_args(1)
+            .action(ArgAction::Set)
+            .requires("PLUGIN")
+            .help("SIP003/SIP003u plugin mode, must be one of `tcp_only` (default), `udp_only` and `tcp_and_udp`"),
+    )
+    .arg(
         Arg::new("PLUGIN_OPT")
             .long("plugin-opts")
             .num_args(1)
@@ -183,7 +201,7 @@ pub fn define_command_line_options(mut app: Command) -> Command {
             .help("Set SIP003 plugin options"),
     )
     .arg(
-        Arg::new("URL")
+        Arg::new("SERVER_URL")
             .long("server-url")
             .num_args(1)
             .action(ArgAction::Set)
@@ -192,7 +210,7 @@ pub fn define_command_line_options(mut app: Command) -> Command {
             .help("Server address in SIP002 (https://shadowsocks.org/guide/sip002.html) URL"),
     )
     .group(ArgGroup::new("SERVER_CONFIG")
-        .arg("SERVER_ADDR").arg("URL").multiple(true))
+        .arg("SERVER_ADDR").arg("SERVER_URL").multiple(true))
     .arg(
         Arg::new("ACL")
             .long("acl")
@@ -202,9 +220,11 @@ pub fn define_command_line_options(mut app: Command) -> Command {
             .help("Path to ACL (Access Control List)"),
     )
     .arg(Arg::new("DNS").long("dns").num_args(1).action(ArgAction::Set).help("DNS nameservers, formatted like [(tcp|udp)://]host[:port][,host[:port]]..., or unix:///path/to/dns, or predefined keys like \"google\", \"cloudflare\""))
+    .arg(Arg::new("DNS_CACHE_SIZE").long("dns-cache-size").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(usize)).help("DNS cache size in number of records. Works when trust-dns DNS backend is enabled."))
     .arg(Arg::new("TCP_NO_DELAY").long("tcp-no-delay").alias("no-delay").action(ArgAction::SetTrue).help("Set TCP_NODELAY option for sockets"))
     .arg(Arg::new("TCP_FAST_OPEN").long("tcp-fast-open").alias("fast-open").action(ArgAction::SetTrue).help("Enable TCP Fast Open (TFO)"))
     .arg(Arg::new("TCP_KEEP_ALIVE").long("tcp-keep-alive").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(u64)).help("Set TCP keep alive timeout seconds"))
+    .arg(Arg::new("TCP_MULTIPATH").long("tcp-multipath").alias("mptcp").action(ArgAction::SetTrue).help("Enable Multipath-TCP (MPTCP)"))
     .arg(Arg::new("UDP_TIMEOUT").long("udp-timeout").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(u64)).help("Timeout seconds for UDP relay"))
     .arg(Arg::new("UDP_MAX_ASSOCIATIONS").long("udp-max-associations").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(usize)).help("Maximum associations to be kept simultaneously for UDP relay"))
     .arg(Arg::new("INBOUND_SEND_BUFFER_SIZE").long("inbound-send-buffer-size").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(u32)).help("Set inbound sockets' SO_SNDBUF option"))
@@ -439,6 +459,43 @@ pub fn define_command_line_options(mut app: Command) -> Command {
         }
     }
 
+    #[cfg(feature = "local-fake-dns")]
+    {
+        app = app
+            .arg(
+                Arg::new("FAKE_DNS_RECORD_EXPIRE_DURATION")
+                    .long("fake-dns-record-expire-duration")
+                    .num_args(1)
+                    .action(ArgAction::Set)
+                    .value_parser(clap::value_parser!(u64))
+                    .help("Fake DNS record expire duration in seconds"),
+            )
+            .arg(
+                Arg::new("FAKE_DNS_IPV4_NETWORK")
+                    .long("fake-dns-ipv4-network")
+                    .num_args(1)
+                    .action(ArgAction::Set)
+                    .value_parser(vparser::parse_ipnet)
+                    .help("Fake DNS IPv4 address network"),
+            )
+            .arg(
+                Arg::new("FAKE_DNS_IPV6_NETWORK")
+                    .long("fake-dns-ipv6-network")
+                    .num_args(1)
+                    .action(ArgAction::Set)
+                    .value_parser(vparser::parse_ipnet)
+                    .help("Fake DNS IPv6 address network"),
+            )
+            .arg(
+                Arg::new("FAKE_DNS_DATABASE_PATH")
+                    .long("fake-dns-database-path")
+                    .num_args(1)
+                    .action(ArgAction::Set)
+                    .value_hint(ValueHint::AnyPath)
+                    .help("Fake DNS database storage path"),
+            );
+    }
+
     #[cfg(unix)]
     {
         app = app
@@ -492,15 +549,37 @@ pub fn define_command_line_options(mut app: Command) -> Command {
         );
     }
 
+    #[cfg(feature = "local-online-config")]
+    {
+        app = app
+            .arg(
+                Arg::new("ONLINE_CONFIG_URL")
+                    .long("online-config-url")
+                    .num_args(1)
+                    .action(ArgAction::Set)
+                    .value_hint(ValueHint::Url)
+                    .help("SIP008 Online Configuration Delivery URL (https://shadowsocks.org/doc/sip008.html)"),
+            )
+            .arg(
+                Arg::new("ONLINE_CONFIG_UPDATE_INTERVAL")
+                    .long("online-config-update-interval")
+                    .num_args(1)
+                    .action(ArgAction::Set)
+                    .value_parser(clap::value_parser!(u64))
+                    .help("SIP008 Online Configuration Delivery update interval in seconds, 3600 by default"),
+            );
+    }
+
     app
 }
 
-/// Program entrance `main`
-pub fn main(matches: &ArgMatches) -> ExitCode {
-    let (config, runtime) = {
+/// Create `Runtime` and `main` entry
+pub fn create(matches: &ArgMatches) -> Result<(Runtime, impl Future<Output = ExitCode>), ExitCode> {
+    #[cfg_attr(not(feature = "local-online-config"), allow(unused_mut))]
+    let (mut config, service_config, runtime) = {
         let config_path_opt = matches.get_one::<PathBuf>("CONFIG").cloned().or_else(|| {
             if !matches.contains_id("SERVER_CONFIG") {
-                match crate::config::get_default_config_path() {
+                match crate::config::get_default_config_path("local.json") {
                     None => None,
                     Some(p) => {
                         println!("loading default config {p:?}");
@@ -517,7 +596,7 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
                 Ok(c) => c,
                 Err(err) => {
                     eprintln!("loading config {config_path:?}, {err}");
-                    return crate::EXIT_CODE_LOAD_CONFIG_FAILURE.into();
+                    return Err(crate::EXIT_CODE_LOAD_CONFIG_FAILURE.into());
                 }
             },
             None => ServiceConfig::default(),
@@ -541,7 +620,7 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
                 Ok(cfg) => cfg,
                 Err(err) => {
                     eprintln!("loading config {cpath:?}, {err}");
-                    return crate::EXIT_CODE_LOAD_CONFIG_FAILURE.into();
+                    return Err(crate::EXIT_CODE_LOAD_CONFIG_FAILURE.into());
                 }
             },
             None => Config::new(ConfigType::Local),
@@ -573,6 +652,7 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
             let timeout = matches.get_one::<u64>("TIMEOUT").map(|x| Duration::from_secs(*x));
 
             let mut sc = ServerConfig::new(svr_addr, password, method);
+            sc.set_source(ServerSource::CommandLine);
             if let Some(timeout) = timeout {
                 sc.set_timeout(timeout);
             }
@@ -582,6 +662,13 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
                     plugin: p,
                     plugin_opts: matches.get_one::<String>("PLUGIN_OPT").cloned(),
                     plugin_args: Vec::new(),
+                    plugin_mode: matches
+                        .get_one::<String>("PLUGIN_MODE")
+                        .map(|x| {
+                            x.parse::<Mode>()
+                                .expect("plugin-mode must be one of `tcp_only` (default), `udp_only` and `tcp_and_udp`")
+                        })
+                        .unwrap_or(Mode::TcpOnly),
                 };
 
                 sc.set_plugin(plugin);
@@ -590,7 +677,8 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
             config.server.push(ServerInstanceConfig::with_server_config(sc));
         }
 
-        if let Some(svr_addr) = matches.get_one::<ServerConfig>("URL").cloned() {
+        if let Some(mut svr_addr) = matches.get_one::<ServerConfig>("SERVER_URL").cloned() {
+            svr_addr.set_source(ServerSource::CommandLine);
             config.server.push(ServerInstanceConfig::with_server_config(svr_addr));
         }
 
@@ -723,6 +811,24 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
                 }
             }
 
+            #[cfg(feature = "local-fake-dns")]
+            {
+                use ipnet::{Ipv4Net, Ipv6Net};
+
+                if let Some(d) = matches.get_one::<u64>("FAKE_DNS_RECORD_EXPIRE_DURATION") {
+                    local_config.fake_dns_record_expire_duration = Some(Duration::from_secs(*d));
+                }
+                if let Some(n) = matches.get_one::<Ipv4Net>("FAKE_DNS_IPV4_NETWORK") {
+                    local_config.fake_dns_ipv4_network = Some(*n);
+                }
+                if let Some(n) = matches.get_one::<Ipv6Net>("FAKE_DNS_IPV6_NETWORK") {
+                    local_config.fake_dns_ipv6_network = Some(*n);
+                }
+                if let Some(p) = matches.get_one::<PathBuf>("FAKE_DNS_DATABASE_PATH").cloned() {
+                    local_config.fake_dns_database_path = Some(p);
+                }
+            }
+
             if matches.get_flag("UDP_ONLY") {
                 local_config.mode = Mode::UdpOnly;
             }
@@ -744,6 +850,10 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
 
         if let Some(keep_alive) = matches.get_one::<u64>("TCP_KEEP_ALIVE") {
             config.keep_alive = Some(Duration::from_secs(*keep_alive));
+        }
+
+        if matches.get_flag("TCP_MULTIPATH") {
+            config.mptcp = true;
         }
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -775,7 +885,7 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
                 Ok(acl) => acl,
                 Err(err) => {
                     eprintln!("loading ACL \"{acl_file}\", {err}");
-                    return crate::EXIT_CODE_LOAD_ACL_FAILURE.into();
+                    return Err(crate::EXIT_CODE_LOAD_ACL_FAILURE.into());
                 }
             };
             config.acl = Some(acl);
@@ -783,6 +893,10 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
 
         if let Some(dns) = matches.get_one::<String>("DNS") {
             config.set_dns_formatted(dns).expect("dns");
+        }
+
+        if let Some(dns_cache_size) = matches.get_one::<usize>("DNS_CACHE_SIZE") {
+            config.dns_cache_size = Some(*dns_cache_size);
         }
 
         if matches.get_flag("IPV6_FIRST") {
@@ -814,6 +928,17 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
             config.outbound_bind_addr = Some(*bind_addr);
         }
 
+        #[cfg(feature = "local-online-config")]
+        if let Some(online_config_url) = matches.get_one::<String>("ONLINE_CONFIG_URL") {
+            use crate::config::OnlineConfig;
+
+            let online_config_update_interval = matches.get_one::<u64>("ONLINE_CONFIG_UPDATE_INTERVAL").cloned();
+            service_config.online_config = Some(OnlineConfig {
+                config_url: online_config_url.clone(),
+                update_interval: online_config_update_interval.map(Duration::from_secs),
+            });
+        }
+
         // DONE READING options
 
         if config.local.is_empty() {
@@ -821,12 +946,12 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
                 "missing `local_address`, consider specifying it by --local-addr command line option, \
                     or \"local_address\" and \"local_port\" in configuration file"
             );
-            return crate::EXIT_CODE_INSUFFICIENT_PARAMS.into();
+            return Err(crate::EXIT_CODE_INSUFFICIENT_PARAMS.into());
         }
 
         if let Err(err) = config.check_integrity() {
             eprintln!("config integrity check failed, {err}");
-            return crate::EXIT_CODE_LOAD_CONFIG_FAILURE.into();
+            return Err(crate::EXIT_CODE_LOAD_CONFIG_FAILURE.into());
         }
 
         #[cfg(unix)]
@@ -837,7 +962,10 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
 
         #[cfg(unix)]
         if let Some(uname) = matches.get_one::<String>("USER") {
-            crate::sys::run_as_user(uname);
+            if let Err(err) = crate::sys::run_as_user(uname) {
+                eprintln!("failed to change as user, error: {err}");
+                return Err(crate::EXIT_CODE_INSUFFICIENT_PARAMS.into());
+            }
         }
 
         info!("shadowsocks local {} build {}", crate::VERSION, crate::BUILD_TIME);
@@ -857,70 +985,319 @@ pub fn main(matches: &ArgMatches) -> ExitCode {
 
         let runtime = builder.enable_all().build().expect("create tokio Runtime");
 
-        (config, runtime)
+        (config, service_config, runtime)
     };
 
-    runtime.block_on(async move {
+    let main_fut = async move {
         let config_path = config.config_path.clone();
 
-        let instance = create_local(config).await.expect("create local");
-
-        if let Some(config_path) = config_path {
-            launch_reload_server_task(config_path, instance.server_balancer().clone());
+        let mut static_servers = Vec::new();
+        for server in config.server.iter() {
+            match server.config.source() {
+                ServerSource::Default | ServerSource::CommandLine => {
+                    static_servers.push(server.clone());
+                }
+                _ => {}
+            }
         }
 
-        let abort_signal = monitor::create_signal_monitor();
-        let server = instance.wait_until_exit();
+        #[cfg(not(feature = "local-online-config"))]
+        let _ = service_config;
 
+        // Fetch servers from remote for the first time
+        #[cfg(feature = "local-online-config")]
+        if let Some(ref online_config) = service_config.online_config {
+            if let Ok(mut servers) = get_online_config_servers(&online_config.config_url).await {
+                config.server.append(&mut servers);
+            }
+        }
+
+        // Double check
+        if config.server.is_empty() {
+            eprintln!("local server cannot run without any valid servers");
+            return crate::EXIT_CODE_LOAD_CONFIG_FAILURE.into();
+        }
+
+        let instance = Server::new(config).await.expect("create local");
+
+        let reload_task = ServerReloader {
+            config_path,
+            balancer: instance.server_balancer().clone(),
+            static_servers,
+            #[cfg(feature = "local-online-config")]
+            online_config_url: service_config.online_config.as_ref().map(|c| c.config_url.clone()),
+            #[cfg(feature = "local-online-config")]
+            online_config_update_interval: service_config.online_config.as_ref().and_then(|c| c.update_interval),
+        }
+        .launch_reload_server_task();
+
+        let abort_signal = monitor::create_signal_monitor();
+        let server = instance.run();
+
+        let reload_task = reload_task.fuse();
+        let abort_signal = abort_signal.fuse();
+        let server = server.fuse();
+
+        tokio::pin!(reload_task);
         tokio::pin!(abort_signal);
         tokio::pin!(server);
 
-        match future::select(server, abort_signal).await {
-            // Server future resolved without an error. This should never happen.
-            Either::Left((Ok(..), ..)) => {
-                eprintln!("server exited unexpectedly");
-                crate::EXIT_CODE_SERVER_EXIT_UNEXPECTEDLY.into()
+        loop {
+            futures::select! {
+                server_res = server => {
+                    match server_res {
+                        // Server future resolved without an error. This should never happen.
+                        Ok(..) => {
+                            eprintln!("server exited unexpectedly");
+                            return crate::EXIT_CODE_SERVER_EXIT_UNEXPECTEDLY.into();
+                        }
+                        // Server future resolved with error, which are listener errors in most cases
+                        Err(err) => {
+                            eprintln!("server aborted with {err}");
+                            return crate::EXIT_CODE_SERVER_ABORTED.into();
+                        }
+                    }
+                }
+                // The abort signal future resolved. Means we should just exit.
+                _ = abort_signal => {
+                    return ExitCode::SUCCESS;
+                }
+                _ = reload_task => {
+                    // continue.
+                    trace!("server-loader task task exited");
+                }
             }
-            // Server future resolved with error, which are listener errors in most cases
-            Either::Left((Err(err), ..)) => {
-                eprintln!("server aborted with {err}");
-                crate::EXIT_CODE_SERVER_ABORTED.into()
-            }
-            // The abort signal future resolved. Means we should just exit.
-            Either::Right(_) => ExitCode::SUCCESS,
         }
-    })
+    };
+
+    Ok((runtime, main_fut))
 }
 
-#[cfg(unix)]
-fn launch_reload_server_task(config_path: PathBuf, balancer: PingBalancer) {
-    use log::error;
-    use tokio::signal::unix::{signal, SignalKind};
+/// Program entrance `main`
+#[inline]
+pub fn main(matches: &ArgMatches) -> ExitCode {
+    match create(matches) {
+        Ok((runtime, main_fut)) => runtime.block_on(main_fut),
+        Err(code) => code,
+    }
+}
 
-    tokio::spawn(async move {
-        let mut sigusr1 = signal(SignalKind::user_defined1()).expect("signal");
+struct ServerReloader {
+    config_path: Option<PathBuf>,
+    static_servers: Vec<ServerInstanceConfig>,
+    balancer: PingBalancer,
+    #[cfg(feature = "local-online-config")]
+    online_config_url: Option<String>,
+    #[cfg(feature = "local-online-config")]
+    online_config_update_interval: Option<Duration>,
+}
 
-        while sigusr1.recv().await.is_some() {
-            let config = match Config::load_from_file(&config_path, ConfigType::Local) {
+#[cfg(feature = "local-online-config")]
+async fn get_online_config_servers(
+    online_config_url: &str,
+) -> Result<Vec<ServerInstanceConfig>, Box<dyn std::error::Error>> {
+    use log::warn;
+
+    #[inline]
+    async fn get_online_config(online_config_url: &str) -> reqwest::Result<String> {
+        let response = reqwest::get(online_config_url).await?;
+        if response.url().scheme() != "https" {
+            warn!(
+                "SIP008 suggests configuration URL should use https, but current URL is {}",
+                response.url().scheme()
+            );
+        }
+
+        // Content-Type: application/json; charset=utf-8
+        // mandatory in standard SIP008
+        match response.headers().get("Content-Type") {
+            Some(h) => {
+                if h != "application/json; charset=utf-8" {
+                    warn!(
+                        "SIP008 Content-Type must be \"application/json; charset=utf-8\", but found {}",
+                        h.to_str().unwrap_or("[non-utf8-value]")
+                    );
+                }
+            }
+            None => {
+                warn!("missing Content-Type in SIP008 response from {}", online_config_url);
+            }
+        }
+
+        response.text().await
+    }
+
+    let body = match get_online_config(online_config_url).await {
+        Ok(b) => b,
+        Err(err) => {
+            error!(
+                "server-loader task failed to load from url: {}, error: {}",
+                online_config_url, err
+            );
+            return Err(Box::new(err));
+        }
+    };
+
+    let online_config = match Config::load_from_str(&body, ConfigType::OnlineConfig) {
+        Ok(c) => c,
+        Err(err) => {
+            error!(
+                "server-loader task failed to load from url: {}, error: {}",
+                online_config_url, err
+            );
+            return Err(Box::new(err));
+        }
+    };
+
+    if let Err(err) = online_config.check_integrity() {
+        error!(
+            "server-loader task failed to load from url: {}, error: {}",
+            online_config_url, err
+        );
+        return Err(Box::new(err));
+    }
+
+    Ok(online_config.server)
+}
+
+impl ServerReloader {
+    #[cfg_attr(not(any(unix, feature = "local-online-config")), allow(dead_code))]
+    async fn run_once(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let start_time = Instant::now();
+
+        let mut servers = self.static_servers.clone();
+
+        // Load servers from source
+        if let Some(ref config_path) = self.config_path {
+            let mut source_config = match Config::load_from_file(config_path, ConfigType::Local) {
                 Ok(c) => c,
                 Err(err) => {
-                    error!("auto-reload {} failed with error: {}", config_path.display(), err);
-                    continue;
+                    error!(
+                        "server-loader task failed to load from file: {}, error: {}",
+                        config_path.display(),
+                        err
+                    );
+                    return Err(Box::new(err));
                 }
             };
+            servers.append(&mut source_config.server);
+        }
 
-            let servers: Vec<ServerConfig> = config.server.into_iter().map(|s| s.config).collect();
-            info!("auto-reload {} with {} servers", config_path.display(), servers.len());
+        // Load servers from online-config (SIP008)
+        #[cfg(feature = "local-online-config")]
+        if let Some(ref online_config_url) = self.online_config_url {
+            let mut online_servers = get_online_config_servers(online_config_url).await?;
+            servers.append(&mut online_servers);
+        }
 
-            if let Err(err) = balancer.reset_servers(servers).await {
-                error!("auto-reload {} but found error: {}", config_path.display(), err);
+        let server_len = servers.len();
+
+        struct ConfigDisplay<'a>(&'a ServerReloader);
+        impl Display for ConfigDisplay<'_> {
+            #[cfg_attr(not(feature = "local-online-config"), allow(unused_assignments, unused_variables))]
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut is_first = true;
+
+                if let Some(ref config_path) = self.0.config_path {
+                    config_path.display().fmt(f)?;
+                    is_first = false;
+                }
+
+                #[cfg(feature = "local-online-config")]
+                if let Some(ref online_config_url) = self.0.online_config_url {
+                    if !is_first {
+                        f.write_str(", ")?;
+                        f.write_str(online_config_url)?;
+                    }
+                }
+
+                Ok(())
             }
         }
-    });
-}
 
-#[cfg(not(unix))]
-fn launch_reload_server_task(_: PathBuf, _: PingBalancer) {}
+        let fetch_end_time = Instant::now();
+
+        if let Err(err) = self.balancer.reset_servers(servers).await {
+            error!("server-loader task {} servers but found error: {}", server_len, err);
+            return Err(Box::new(err));
+        }
+
+        let total_end_time = Instant::now();
+
+        info!(
+            "server-loader task load from {} with {} servers, fetch costs: {:?}, total costs: {:?}",
+            ConfigDisplay(self),
+            server_len,
+            fetch_end_time - start_time,
+            total_end_time - start_time,
+        );
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn launch_signal_reload_server_task(self: Arc<Self>) {
+        use log::debug;
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigusr1 = signal(SignalKind::user_defined1()).expect("signal");
+
+        debug!("server-loader task is now listening USR1");
+
+        while sigusr1.recv().await.is_some() {
+            let _ = self.run_once().await;
+        }
+    }
+
+    #[cfg(feature = "local-online-config")]
+    async fn launch_online_reload_server_task(self: Arc<Self>) {
+        use log::debug;
+        use tokio::time;
+
+        let update_interval = self
+            .online_config_update_interval
+            .unwrap_or(Duration::from_secs(60 * 60));
+
+        debug!("server-loader task updating in interval {:?}", update_interval);
+
+        loop {
+            time::sleep(update_interval).await;
+            let _ = self.run_once().await;
+        }
+    }
+
+    async fn launch_reload_server_task(self) {
+        let arc_self = Arc::new(self);
+
+        #[allow(unused_mut)]
+        let mut futs: Vec<BoxFuture<()>> = Vec::new();
+
+        #[cfg(unix)]
+        {
+            #[cfg_attr(not(feature = "local-online-config"), allow(unused_mut))]
+            let mut has_things_to_do = arc_self.config_path.is_some();
+            #[cfg(feature = "local-online-config")]
+            {
+                has_things_to_do = has_things_to_do || arc_self.online_config_url.is_some();
+            }
+
+            if has_things_to_do {
+                futs.push(arc_self.clone().launch_signal_reload_server_task().boxed());
+            }
+        }
+
+        #[cfg(feature = "local-online-config")]
+        if arc_self.online_config_url.is_some() {
+            futs.push(arc_self.clone().launch_online_reload_server_task().boxed());
+        }
+
+        if !futs.is_empty() {
+            future::join_all(futs.into_iter()).await;
+        }
+
+        drop(arc_self);
+    }
+}
 
 #[cfg(test)]
 mod test {

@@ -4,18 +4,35 @@
 use std::os::unix::io::RawFd;
 use std::{
     io::{self, ErrorKind},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
 
 use byte_string::ByteStr;
-use ipnet::IpNet;
+use cfg_if::cfg_if;
+use ipnet::{IpNet, Ipv4Net};
 use log::{debug, error, info, trace, warn};
 use shadowsocks::config::Mode;
 use smoltcp::wire::{IpProtocol, TcpPacket, UdpPacket};
 use tokio::{io::AsyncReadExt, sync::mpsc, time};
-use tun::{AsyncDevice, Configuration as TunConfiguration, Device as TunDevice, Error as TunError, Layer};
+
+cfg_if! {
+    if #[cfg(any(target_os = "ios",
+                 target_os = "macos",
+                 target_os = "linux",
+                 target_os = "android",
+                 target_os = "windows"))] {
+        use tun::{
+            create_as_async, AsyncDevice, Configuration as TunConfiguration, Device as TunDevice, Error as TunError, Layer,
+        };
+    } else {
+        use tun::{Configuration as TunConfiguration, Device as TunDevice, Error as TunError, Layer};
+
+        mod fake_tun;
+        use self::fake_tun::{create_as_async, AsyncDevice};
+    }
+}
 
 use crate::local::{context::ServiceContext, loadbalancing::PingBalancer};
 
@@ -32,6 +49,7 @@ mod tcp;
 mod udp;
 mod virt_device;
 
+/// Tun service builder
 pub struct TunBuilder {
     context: Arc<ServiceContext>,
     balancer: PingBalancer,
@@ -42,6 +60,7 @@ pub struct TunBuilder {
 }
 
 impl TunBuilder {
+    /// Create a Tun service builder
     pub fn new(context: Arc<ServiceContext>, balancer: PingBalancer) -> TunBuilder {
         TunBuilder {
             context,
@@ -53,52 +72,46 @@ impl TunBuilder {
         }
     }
 
-    pub fn address(mut self, addr: IpNet) -> TunBuilder {
+    pub fn address(&mut self, addr: IpNet) {
         self.tun_config.address(addr.addr()).netmask(addr.netmask());
-        self
     }
 
-    pub fn destination(mut self, addr: IpNet) -> TunBuilder {
+    pub fn destination(&mut self, addr: IpNet) {
         self.tun_config.destination(addr.addr());
-        self
     }
 
-    pub fn name(mut self, name: &str) -> TunBuilder {
+    pub fn name(&mut self, name: &str) {
         self.tun_config.name(name);
-        self
     }
 
     #[cfg(unix)]
-    pub fn file_descriptor(mut self, fd: RawFd) -> TunBuilder {
+    pub fn file_descriptor(&mut self, fd: RawFd) {
         self.tun_config.raw_fd(fd);
-        self
     }
 
-    pub fn udp_expiry_duration(mut self, udp_expiry_duration: Duration) -> TunBuilder {
+    pub fn udp_expiry_duration(&mut self, udp_expiry_duration: Duration) {
         self.udp_expiry_duration = Some(udp_expiry_duration);
-        self
     }
 
-    pub fn udp_capacity(mut self, udp_capacity: usize) -> TunBuilder {
+    pub fn udp_capacity(&mut self, udp_capacity: usize) {
         self.udp_capacity = Some(udp_capacity);
-        self
     }
 
-    pub fn mode(mut self, mode: Mode) -> TunBuilder {
+    pub fn mode(&mut self, mode: Mode) {
         self.mode = mode;
-        self
     }
 
+    /// Build Tun server
     pub async fn build(mut self) -> io::Result<Tun> {
         self.tun_config.layer(Layer::L3).up();
 
-        #[cfg(any(target_os = "linux"))]
+        #[cfg(target_os = "linux")]
         self.tun_config.platform(|tun_config| {
             // IFF_NO_PI preventing excessive buffer reallocating
             tun_config.packet_information(false);
         });
 
-        let device = match tun::create_as_async(&self.tun_config) {
+        let device = match create_as_async(&self.tun_config) {
             Ok(d) => d,
             Err(TunError::Io(err)) => return Err(err),
             Err(err) => return Err(io::Error::new(ErrorKind::Other, err)),
@@ -128,6 +141,7 @@ impl TunBuilder {
     }
 }
 
+/// Tun service
 pub struct Tun {
     device: AsyncDevice,
     tcp: TcpTun,
@@ -138,6 +152,7 @@ pub struct Tun {
 }
 
 impl Tun {
+    /// Start serving
     pub async fn run(mut self) -> io::Result<()> {
         if let Ok(mtu) = self.device.get_ref().mtu() {
             assert!(mtu > 0 && mtu as usize > IFF_PI_PREFIX_LEN);
@@ -145,9 +160,51 @@ impl Tun {
 
         info!(
             "shadowsocks tun device {}, mode {}",
-            self.device.get_ref().name(),
+            self.device
+                .get_ref()
+                .name()
+                .or_else(|r| Ok::<_, ()>(r.to_string()))
+                .unwrap(),
             self.mode,
         );
+
+        let address = match self.device.get_ref().address() {
+            Ok(a) => a,
+            Err(err) => {
+                error!("[TUN] failed to get device address, error: {}", err);
+                return Err(io::Error::new(io::ErrorKind::Other, err));
+            }
+        };
+
+        let netmask = match self.device.get_ref().netmask() {
+            Ok(n) => n,
+            Err(err) => {
+                error!("[TUN] failed to get device netmask, error: {}", err);
+                return Err(io::Error::new(io::ErrorKind::Other, err));
+            }
+        };
+
+        let address_net = match Ipv4Net::with_netmask(address, netmask) {
+            Ok(n) => n,
+            Err(err) => {
+                error!("[TUN] invalid address {}, netmask {}, error: {}", address, netmask, err);
+                return Err(io::Error::new(io::ErrorKind::Other, err));
+            }
+        };
+
+        trace!(
+            "[TUN] tun device network: {} (address: {}, netmask: {})",
+            address_net,
+            address,
+            netmask
+        );
+
+        // Set default route
+        if let Err(err) = sys::set_route_configuration(self.device.get_mut()).await {
+            warn!("[TUN] tun device set route failed, error: {}", err);
+        }
+
+        let address_broadcast = address_net.broadcast();
 
         let mut packet_buffer = vec![0u8; 65536 + IFF_PI_PREFIX_LEN].into_boxed_slice();
         let mut udp_cleanup_timer = time::interval(self.udp_cleanup_interval);
@@ -169,7 +226,7 @@ impl Tun {
                     let packet = &mut packet_buffer[IFF_PI_PREFIX_LEN..n];
                     trace!("[TUN] received IP packet {:?}", ByteStr::new(packet));
 
-                    if let Err(err) = self.handle_tun_frame(packet).await {
+                    if let Err(err) = self.handle_tun_frame(&address_broadcast, packet).await {
                         error!("[TUN] handle IP frame failed, error: {}", err);
                     }
                 }
@@ -206,7 +263,7 @@ impl Tun {
         }
     }
 
-    async fn handle_tun_frame(&mut self, frame: &[u8]) -> smoltcp::wire::Result<()> {
+    async fn handle_tun_frame(&mut self, device_broadcast_addr: &Ipv4Addr, frame: &[u8]) -> smoltcp::wire::Result<()> {
         let packet = match IpPacket::new_checked(frame)? {
             Some(packet) => packet,
             None => {
@@ -214,6 +271,32 @@ impl Tun {
                 return Ok(());
             }
         };
+
+        let src_ip_addr = packet.src_addr();
+        let dst_ip_addr = packet.dst_addr();
+        let src_non_unicast = match src_ip_addr {
+            IpAddr::V4(v4) => {
+                v4.is_broadcast() || v4.is_multicast() || v4.is_unspecified() || v4 == *device_broadcast_addr
+            }
+            IpAddr::V6(v6) => v6.is_multicast() || v6.is_unspecified(),
+        };
+        let dst_non_unicast = match dst_ip_addr {
+            IpAddr::V4(v4) => {
+                v4.is_broadcast() || v4.is_multicast() || v4.is_unspecified() || v4 == *device_broadcast_addr
+            }
+            IpAddr::V6(v6) => v6.is_multicast() || v6.is_unspecified(),
+        };
+
+        if src_non_unicast || dst_non_unicast {
+            trace!(
+                "[TUN] IP packet {} (unicast? {}) -> {} (unicast? {}) throwing away",
+                src_ip_addr,
+                !src_non_unicast,
+                dst_ip_addr,
+                !dst_non_unicast
+            );
+            return Ok(());
+        }
 
         match packet.protocol() {
             IpProtocol::Tcp => {
@@ -242,7 +325,14 @@ impl Tun {
                 let src_addr = SocketAddr::new(packet.src_addr(), src_port);
                 let dst_addr = SocketAddr::new(packet.dst_addr(), dst_port);
 
-                trace!("[TUN] TCP packet {} -> {} {}", src_addr, dst_addr, tcp_packet);
+                trace!(
+                    "[TUN] TCP packet {} (unicast? {}) -> {} (unicast? {}) {}",
+                    src_addr,
+                    !src_non_unicast,
+                    dst_addr,
+                    !dst_non_unicast,
+                    tcp_packet
+                );
 
                 // TCP first handshake packet.
                 if let Err(err) = self.tcp.handle_packet(src_addr, dst_addr, &tcp_packet).await {
@@ -277,11 +367,18 @@ impl Tun {
                 let src_port = udp_packet.src_port();
                 let dst_port = udp_packet.dst_port();
 
-                let src_addr = SocketAddr::new(packet.src_addr(), src_port);
+                let src_addr = SocketAddr::new(src_ip_addr, src_port);
                 let dst_addr = SocketAddr::new(packet.dst_addr(), dst_port);
 
                 let payload = udp_packet.payload();
-                trace!("[TUN] UDP packet {} -> {} {}", src_addr, dst_addr, udp_packet);
+                trace!(
+                    "[TUN] UDP packet {} (unicast? {}) -> {} (unicast? {}) {}",
+                    src_addr,
+                    !src_non_unicast,
+                    dst_addr,
+                    !dst_non_unicast,
+                    udp_packet
+                );
 
                 if let Err(err) = self.udp.handle_packet(src_addr, dst_addr, payload).await {
                     error!("handle UDP packet failed, err: {}, packet: {:?}", err, udp_packet);
