@@ -25,12 +25,7 @@ use shadowsocks_service::shadowsocks::relay::socks5::Address;
 use shadowsocks_service::{
     acl::AccessControl,
     config::{
-        read_variable_field_value,
-        Config,
-        ConfigType,
-        LocalConfig,
-        LocalInstanceConfig,
-        ProtocolType,
+        read_variable_field_value, Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType,
         ServerInstanceConfig,
     },
     local::{loadbalancing::PingBalancer, Server},
@@ -45,8 +40,7 @@ use shadowsocks_service::{
 use crate::logging;
 use crate::{
     config::{Config as ServiceConfig, RuntimeMode},
-    monitor,
-    vparser,
+    monitor, vparser,
 };
 
 #[cfg(feature = "local-dns")]
@@ -1186,7 +1180,7 @@ impl ServerReloader {
         // Load servers from online-config (SIP008)
         #[cfg(feature = "local-online-config")]
         if let Some(ref online_config_url) = self.online_config_url {
-            let mut online_servers = get_online_config_servers(&online_config_url).await?;
+            let mut online_servers = get_online_config_servers(online_config_url).await?;
             servers.append(&mut online_servers);
         }
 
@@ -1207,7 +1201,7 @@ impl ServerReloader {
                 if let Some(ref online_config_url) = self.0.online_config_url {
                     if !is_first {
                         f.write_str(", ")?;
-                        f.write_str(&online_config_url)?;
+                        f.write_str(online_config_url)?;
                     }
                 }
 
@@ -1226,7 +1220,7 @@ impl ServerReloader {
 
         info!(
             "server-loader task load from {} with {} servers, fetch costs: {:?}, total costs: {:?}",
-            ConfigDisplay(&self),
+            ConfigDisplay(self),
             server_len,
             fetch_end_time - start_time,
             total_end_time - start_time,
@@ -1256,7 +1250,7 @@ impl ServerReloader {
 
         let update_interval = self
             .online_config_update_interval
-            .unwrap_or(Duration::from_secs(1 * 60 * 60));
+            .unwrap_or(Duration::from_secs(60 * 60));
 
         debug!("server-loader task updating in interval {:?}", update_interval);
 
